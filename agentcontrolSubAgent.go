@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"sync"
 
 	"github.com/gosnmp/gosnmp"
 	"github.com/pkg/errors"
@@ -18,6 +19,8 @@ type SubAgent struct {
 	// OIDs for Read/Write actions
 	OIDs []*PDUValueControlItem
 
+	oidLock sync.Mutex
+
 	// UserErrorMarkPacket decides if shll treat user returned error as generr
 	UserErrorMarkPacket bool
 
@@ -27,15 +30,22 @@ type SubAgent struct {
 }
 
 func (t *SubAgent) SyncConfig() error {
-	var (
-		err error
-	)
+
+	t.oidLock.Lock()
+	defer t.oidLock.Unlock()
+
+	t.Logger.Debugf("Total OIDs of %v: %v", t.CommunityIDs, len(t.OIDs))
+
 	for _, oid := range t.OIDs {
-		if err = VerifyOid(oid.OID); err != nil {
+		if err := VerifyOid(oid.OID); err != nil {
 			return err
 		}
 	}
-	t.Logger.Debugf("Total OIDs of %v: %v", t.CommunityIDs, len(t.OIDs))
+
+	if len(t.OIDs) < 2 {
+		//to small to link
+		return nil
+	}
 
 	sort.Sort(byOID(t.OIDs))
 	for id, each := range t.OIDs {
@@ -44,7 +54,15 @@ func (t *SubAgent) SyncConfig() error {
 			return fmt.Errorf("community %v: meet duplicate oid %v", t.CommunityIDs, each.OID)
 		}
 	}
+
+	t.OIDs[0].id = 0
+	for i := 1; i < len(t.OIDs); i++ {
+		t.OIDs[i-1].nextPDU = t.OIDs[i]
+		t.OIDs[i].id = i
+	}
+
 	return nil
+
 }
 
 func (t *SubAgent) Serve(i *gosnmp.SnmpPacket) (*gosnmp.SnmpPacket, error) {
@@ -210,8 +228,8 @@ func (t *SubAgent) serveGetRequest(i *gosnmp.SnmpPacket) (*gosnmp.SnmpPacket, er
 		return &ret, nil
 	}
 	for id, varItem := range i.Variables {
-		item, _ := t.getForPDUValueControl(varItem.Name)
-		if item == nil {
+		item, before := t.getForPDUValueControl(varItem.Name)
+		if item == nil || before {
 			if ret.Error == gosnmp.NoError {
 				ret.Error = gosnmp.NoSuchName
 				ret.ErrorIndex = uint8(id)
@@ -242,8 +260,8 @@ func (t *SubAgent) serveTrap(i *gosnmp.SnmpPacket) (*gosnmp.SnmpPacket, error) {
 	ret.Variables = []gosnmp.SnmpPDU{}
 	t.Logger.Debugf("i.Version == %v len(i.Variables) = %v.", i.Version, len(i.Variables))
 	for id, varItem := range i.Variables {
-		item, _ := t.getForPDUValueControl(varItem.Name)
-		if item == nil {
+		item, before := t.getForPDUValueControl(varItem.Name)
+		if item == nil || before {
 			if ret.Error == gosnmp.NoError {
 				ret.Error = gosnmp.NoSuchName
 				ret.ErrorIndex = uint8(id)
@@ -279,13 +297,12 @@ func (t *SubAgent) serveGetBulkRequest(i *gosnmp.SnmpPacket) (*gosnmp.SnmpPacket
 	for j := uint8(0); j < i.NonRepeaters; j++ {
 		queryForOid := i.Variables[j].Name
 		queryForOidStriped := strings.TrimLeft(queryForOid, ".0")
-		item, id := t.getForPDUValueControl(queryForOidStriped)
-		t.Logger.Debugf("(non-repeater) t.getForPDUValueControl. query_for_oid=%v item=%v id=%v", queryForOid, item, id)
-		if id >= len(t.OIDs) {
+		item, _ := t.getForPDUValueControl(queryForOidStriped)
+		t.Logger.Debugf("(non-repeater) t.getForPDUValueControl. query_for_oid=%v item=%+v ", queryForOid, item)
+		if item == nil {
 			ret.Variables = append(ret.Variables, t.getPDUEndOfMibView(queryForOid))
 			continue
 		}
-		item = t.OIDs[id]
 
 		ctl, snmperr := t.getForPDUValueControlResult(item, i)
 		if snmperr != gosnmp.NoError && ret.Error == gosnmp.NoError {
@@ -301,20 +318,29 @@ func (t *SubAgent) serveGetBulkRequest(i *gosnmp.SnmpPacket) (*gosnmp.SnmpPacket
 		for k := i.NonRepeaters; k < vc; k++ { // loop through "repeaters"
 			queryForOid := i.Variables[k].Name
 			queryForOidStriped := strings.TrimLeft(queryForOid, ".0")
-			item, id := t.getForPDUValueControl(queryForOidStriped)
-			if item != nil {
-				id += 1
+			item, before := t.getForPDUValueControl(queryForOidStriped)
+
+			if !before {
+				item = t.NextPDU(item, 0)
+				if item == nil {
+					break
+				}
+			} else {
+				before = false
 			}
-			nextIndex := id + int(j)
-			if nextIndex >= len(t.OIDs) {
+
+			if j > 0 {
+				item = t.NextPDU(item, int(j)-1)
+			}
+
+			if item == nil {
 				if _, found := eomv[queryForOid]; !found {
 					ret.Variables = append(ret.Variables, t.getPDUEndOfMibView(queryForOid))
 					eomv[queryForOid] = struct{}{}
 				}
 				continue
 			}
-			item = t.OIDs[nextIndex] // repetition next
-			t.Logger.Debugf("t.getForPDUValueControl. query_for_oid=%v item=%v id=%v", queryForOid, item, id)
+			t.Logger.Debugf("t.getForPDUValueControl. query_for_oid=%v item=%v id=%v", queryForOid, item, item.id)
 			ctl, snmperr := t.getForPDUValueControlResult(item, i)
 			if snmperr != gosnmp.NoError && ret.Error == gosnmp.NoError {
 				ret.Error = snmperr
@@ -336,46 +362,41 @@ func (t *SubAgent) serveGetNextRequest(i *gosnmp.SnmpPacket) (*gosnmp.SnmpPacket
 	queryForOid := i.Variables[length-1].Name
 	queryForOidStriped := strings.TrimLeft(queryForOid, ".0")
 	t.Logger.Debugf("serveGetNextRequest of %v", queryForOid)
-	item, id := t.getForPDUValueControl(queryForOidStriped)
-	t.Logger.Debugf("t.getForPDUValueControl. query_for_oid=%v item=%v id=%v", queryForOid, item, id)
-	if item != nil {
-		id += 1
-	}
-	if id >= len(t.OIDs) {
+	item, before := t.getForPDUValueControl(queryForOidStriped)
+	t.Logger.Debugf("t.getForPDUValueControl. query_for_oid=%v item=%v ", queryForOid, item)
+
+	if item == nil {
 		// NOT find for the last
 		ret.Variables = append(ret.Variables, t.getPDUEndOfMibView(queryForOid))
 		return &ret, nil
 	}
-	if i.MaxRepetitions != 0 {
-		length = int(i.MaxRepetitions)
-	}
-	if length+id > len(t.OIDs) {
-		length = len(t.OIDs) - id
-	}
-	t.Logger.Debugf("i.Variables[id: length]. id=%v length =%v. len(t.OIDs)=%v", id, length, len(t.OIDs))
-	iid := id
+
+	t.Logger.Debugf("i.Variables[id: length]. id=%v length =%v. len(t.OIDs)=%v", item.id, length, len(t.OIDs))
 	for {
-		if iid >= len(t.OIDs) {
-			break
+		if !before {
+			item = t.NextPDU(item, 0)
+			if item == nil {
+				break
+			}
+		} else {
+			before = false
 		}
-		item := t.OIDs[iid]
+
 		if len(ret.Variables) >= length {
 			break
 		}
 
 		if item.NonWalkable || item.OnGet == nil {
 			t.Logger.Debugf("getnext: oid=%v. skip for non walkable", item.OID)
-			iid += 1
 			continue // skip non-walkable items
 		}
 		ctl, snmperr := t.getForPDUValueControlResult(item, i)
 		if snmperr != gosnmp.NoError && ret.Error == gosnmp.NoError {
 			ret.Error = snmperr
-			ret.ErrorIndex = uint8(iid)
+			ret.ErrorIndex = uint8(item.id)
 		}
 		t.Logger.Debugf("getnext: append oid=%v. result=%v err=%v", item.OID, ctl, snmperr)
 		ret.Variables = append(ret.Variables, ctl)
-		iid += 1
 	}
 
 	if len(ret.Variables) == 0 {
@@ -394,8 +415,8 @@ func (t *SubAgent) serveSetRequest(i *gosnmp.SnmpPacket) (*gosnmp.SnmpPacket, er
 	ret.PDUType = gosnmp.GetResponse
 	ret.Variables = []gosnmp.SnmpPDU{}
 	for id, varItem := range i.Variables {
-		item, _ := t.getForPDUValueControl(varItem.Name)
-		if item == nil {
+		item, before := t.getForPDUValueControl(varItem.Name)
+		if item == nil || before {
 			if ret.Error == gosnmp.NoError {
 				ret.Error = gosnmp.NoSuchName
 				ret.ErrorIndex = uint8(id)
@@ -448,7 +469,14 @@ func (t *SubAgent) serveSetRequest(i *gosnmp.SnmpPacket) (*gosnmp.SnmpPacket, er
 	return &ret, nil
 }
 
-func (t *SubAgent) getForPDUValueControl(oid string) (*PDUValueControlItem, int) {
+// getForPDUValueControl this function used to lookup the handler for the oid, bool on the end is to indicate if the
+// given oid came before the registered oids. For example if you did an snmpwalk and gave a '1' (IE: show me everything)
+// this function would return the lowest oid value and true.
+func (t *SubAgent) getForPDUValueControl(oid string) (*PDUValueControlItem, bool) {
+
+	t.oidLock.Lock()
+	defer t.oidLock.Unlock()
+
 	toQuery := oidToByteString(oid)
 	i := sort.Search(len(t.OIDs), func(i int) bool {
 		thisOid := oidToByteString(t.OIDs[i].OID)
@@ -460,8 +488,35 @@ func (t *SubAgent) getForPDUValueControl(oid string) (*PDUValueControlItem, int)
 	if i < len(t.OIDs) {
 		// t.OIDs[i].OID == toQuery
 		if compareByteString(oidToByteString(t.OIDs[i].OID), toQuery) == ByteStringCompareResultEqual {
-			return t.OIDs[i], i
+			return t.OIDs[i], false
 		}
 	}
-	return nil, i
+
+	first := i == 0
+	if first && len(t.OIDs) > 0 {
+		return t.OIDs[0], true
+	}
+	return nil, false
+}
+
+func (t *SubAgent) NextPDU(item *PDUValueControlItem, skip int) *PDUValueControlItem {
+	t.oidLock.Lock()
+	defer t.oidLock.Unlock()
+
+	return t.nextPDU(item, skip)
+}
+
+func (t *SubAgent) nextPDU(item *PDUValueControlItem, skip int) *PDUValueControlItem {
+
+	if item == nil || item.nextPDU == nil {
+		return nil
+	}
+
+	if skip == 0 {
+		return item.nextPDU
+	}
+
+	skip--
+	return t.nextPDU(item.nextPDU, skip)
+
 }
