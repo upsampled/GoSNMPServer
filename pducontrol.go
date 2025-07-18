@@ -68,6 +68,9 @@ type PDUValueControlItem struct {
 
 	//Document for this PDU Item. ignored by the program.
 	Document string
+
+	nextPDU *PDUValueControlItem
+	id      int
 }
 
 func Asn1IntegerUnwrap(i interface{}) int { return i.(int) }
